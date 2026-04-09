@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Dave Lee <dave@gray101.com>"]
 license = "MIT"
+description = "Parse the output of `cargo info` into well-typed Rust structures."
+repository = "https://github.com/dave-gray101/cargo_info_types"
 
 [dependencies]
 strip-ansi-escapes = "0.2.1"
