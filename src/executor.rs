@@ -1,3 +1,5 @@
+#![cfg(feature = "execute")]
+
 use std::process::Command;
 
 use crate::parser::ParseError;
@@ -56,7 +58,6 @@ pub enum ExecuteError {
 /// # #[cfg(feature = "execute")]
 /// assert_eq!(info.name, "syn");
 /// ```
-#[cfg(feature = "execute")]
 pub fn execute(crate_name: &str) -> Result<CrateInfo, ExecuteError> {
     let output = Command::new("cargo")
         .args(["info", "-q", crate_name, "--color", "never"])

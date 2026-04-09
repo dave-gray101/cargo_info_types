@@ -1,4 +1,4 @@
-use cargo_info_types::{parse, parse_header, parse_feature_line, strip_key, is_known_key_line, RawFields, ParseError, Feature};
+use cargo_info_types::{parse, parse_header, parse_feature_line, strip_key, is_known_key_line, RawFields, ParseError};
 
 // ── Real cargo info outputs ───────────────────────────────────────────────
 
@@ -837,31 +837,6 @@ crates.io: https://crates.io/crates/prog
     assert_eq!(info.homepage.as_deref(), Some("https://prog.io"));
     assert_eq!(info.repository.as_deref(), Some("https://github.com/prog/prog"));
     assert_eq!(info.crates_io.as_deref(), Some("https://crates.io/crates/prog"));
-}
-
-#[test]
-fn parse_features_before_version_in_description_state() {
-    // This directly exercises Description::transition_to_features
-    // Features appears right after description without any fields before it
-    // The version/license in the features block will be ignored, causing parse error
-    // but the transition function itself will be called
-    // To make this actually parse successfully, we need version/license before features
-    // So this test is to ensure the transition method exists and can be called
-    // We'll create a scenario where it's forced: by mocking the state progression
-    // Actually, for real coverage, we'd need to test that this function is called
-    // But given format constraints, let's merge this with valid parsing:
-    let input = "early-features #test
-Just description
-features:
- +test = []
-version: 1.0.0
-license: MIT
-";
-    // This will fail because version/license appear after features block
-    // and the features block consumes them as unrecognized lines
-    // So we won't test this - instead, let's test Description always transitions
-    // to Fields first when encountering any known key
-    // The transition_to_features might only be reachable if we relax format constraints
 }
 
 #[test]
