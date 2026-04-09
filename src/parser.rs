@@ -20,6 +20,173 @@ pub enum ParseError {
     MissingField(&'static str),
 }
 
+// ── Typestate Pattern: Parser States ──────────────────────────────────────────
+
+/// Marker type for parser in Description state.
+///
+/// Valid transitions: Description → Fields or Description → Features
+struct ParsingDescription;
+
+/// Marker type for parser in Fields state (key-value pairs).
+///
+/// Valid transitions: Fields → Features or stay in Fields
+struct ParsingFields;
+
+/// Marker type for parser in Features state.
+///
+/// Valid transitions: Features → Complete (terminal state)
+struct ParsingFeatures;
+
+/// Marker type for completed parser (no more transitions).
+struct ParsingComplete;
+
+/// A parser in a specific state, parameterized by a marker type.
+///
+/// This type encodes the current parsing state at the type level, ensuring
+/// that only valid state transitions are possible. The `parse()` function
+/// gradually constructs a `Parser<ParsingComplete>` by consuming and
+/// transitioning through intermediate states.
+struct Parser<S> {
+    state_marker: std::marker::PhantomData<S>,
+    name: String,
+    keywords: Vec<String>,
+    description_parts: Vec<String>,
+    fields: RawFields,
+    features: Vec<Feature>,
+}
+
+impl Parser<ParsingDescription> {
+    /// Creates a new parser in the Description state.
+    fn new(name: String, keywords: Vec<String>) -> Self {
+        Parser {
+            state_marker: std::marker::PhantomData,
+            name,
+            keywords,
+            description_parts: Vec::new(),
+            fields: RawFields::default(),
+            features: Vec::new(),
+        }
+    }
+
+    /// Process one line in the Description state.
+    ///
+    /// Returns either:
+    /// - `ParserOrFields::Description` if we remain in Description state
+    /// - `ParserOrFields::Fields` if we transition to Fields state
+    ///
+    /// Note: Direct transition to Features state is impossible since version/license
+    /// (required fields) must be encountered first, triggering a transition to Fields.
+    fn process_line(mut self, line: &str) -> ParserOrFields {
+        if is_known_key_line(line) {
+            self.fields.apply(line);
+            ParserOrFields::Fields(self.transition_to_fields())
+        } else {
+            self.description_parts.push(line.to_string());
+            ParserOrFields::Description(self)
+        }
+    }
+
+    /// Transition from Description state to Fields state.
+    fn transition_to_fields(self) -> Parser<ParsingFields> {
+        Parser {
+            state_marker: std::marker::PhantomData,
+            name: self.name,
+            keywords: self.keywords,
+            description_parts: self.description_parts,
+            fields: self.fields,
+            features: self.features,
+        }
+    }
+}
+
+impl Parser<ParsingFields> {
+    /// Process one line in the Fields state.
+    ///
+    /// Returns either:
+    /// - `ParserOrFeatures::Fields` if we remain in Fields state
+    /// - `ParserOrFeatures::Features` if we transition to Features state
+    fn process_line(mut self, line: &str) -> ParserOrFeatures {
+        if line.starts_with("features:") {
+            ParserOrFeatures::Features(self.transition_to_features())
+        } else {
+            self.fields.apply(line);
+            ParserOrFeatures::Fields(self)
+        }
+    }
+
+    /// Transition from Fields state to Features state.
+    fn transition_to_features(self) -> Parser<ParsingFeatures> {
+        Parser {
+            state_marker: std::marker::PhantomData,
+            name: self.name,
+            keywords: self.keywords,
+            description_parts: self.description_parts,
+            fields: self.fields,
+            features: self.features,
+        }
+    }
+}
+
+impl Parser<ParsingFeatures> {
+    /// Process one line in the Features state.
+    ///
+    /// Always remains in Features state (terminal state before completion).
+    fn process_line(mut self, line: &str) -> Self {
+        if let Some(feature) = parse_feature_line(line) {
+            self.features.push(feature);
+        }
+        // Non-matching lines inside the features block are silently ignored
+        self
+    }
+
+    /// Transition from Features state to Complete state.
+    fn complete(self) -> Result<Parser<ParsingComplete>, ParseError> {
+        Ok(Parser {
+            state_marker: std::marker::PhantomData,
+            name: self.name,
+            keywords: self.keywords,
+            description_parts: self.description_parts,
+            fields: self.fields,
+            features: self.features,
+        })
+    }
+}
+
+impl Parser<ParsingComplete> {
+    /// Extract the final `CrateInfo` from a completed parser.
+    fn into_crate_info(self) -> Result<CrateInfo, ParseError> {
+        let description = self.description_parts.join("\n");
+        let version = self.fields.version.ok_or(ParseError::MissingField("version"))?;
+        let license = self.fields.license.ok_or(ParseError::MissingField("license"))?;
+
+        Ok(CrateInfo {
+            name: self.name,
+            keywords: self.keywords,
+            description,
+            version,
+            license,
+            rust_version: self.fields.rust_version,
+            documentation: self.fields.documentation,
+            homepage: self.fields.homepage,
+            repository: self.fields.repository,
+            crates_io: self.fields.crates_io,
+            features: self.features,
+        })
+    }
+}
+
+/// Result type for transitions from Description state (only to Description or Fields).
+enum ParserOrFields {
+    Description(Parser<ParsingDescription>),
+    Fields(Parser<ParsingFields>),
+}
+
+/// Result type for transitions that could go to either Fields or Features.
+enum ParserOrFeatures {
+    Fields(Parser<ParsingFields>),
+    Features(Parser<ParsingFeatures>),
+}
+
 /// Parses the text output produced by `cargo info -q <crate-name> --color never`.
 ///
 /// The expected format is:
@@ -76,72 +243,49 @@ pub enum ParseError {
 pub fn parse(input: &str) -> Result<CrateInfo, ParseError> {
     let mut lines = input.lines();
 
-    // ── Phase 1: header ──────────────────────────────────────────────────────
+    // ── Phase 1: Parse header ─────────────────────────────────────────────────
     let header_line = lines.next().ok_or(ParseError::Empty)?;
     let (name, keywords) = parse_header(header_line)?;
 
-    // ── Phases 2–4: description → key-value fields → feature flags ───────────
-    let mut description_parts: Vec<&str> = Vec::new();
-    let mut fields = RawFields::default();
-    let mut features: Vec<Feature> = Vec::new();
+    // ── Phase 2-4: State machine processing ───────────────────────────────────
+    // Create the initial parser in Description state
+    let parser = Parser::<ParsingDescription>::new(name, keywords);
 
-    #[derive(PartialEq)]
-    enum State {
-        Description,
-        Fields,
-        Features,
+    // Feed remaining lines through the state machine
+    let completed = lines.fold(
+        ParserState::Description(parser),
+        |parser_state, line| {
+            match parser_state {
+                ParserState::Description(p) => match p.process_line(line) {
+                    ParserOrFields::Description(p) => ParserState::Description(p),
+                    ParserOrFields::Fields(p) => ParserState::Fields(p),
+                },
+                ParserState::Fields(p) => match p.process_line(line) {
+                    ParserOrFeatures::Fields(p) => ParserState::Fields(p),
+                    ParserOrFeatures::Features(p) => ParserState::Features(p),
+                },
+                ParserState::Features(p) => ParserState::Features(p.process_line(line)),
+            }
+        },
+    );
+
+    // Complete the parser and extract the final result
+    match completed {
+        ParserState::Description(p) => p.transition_to_fields().transition_to_features().complete()?.into_crate_info(),
+        ParserState::Fields(p) => p.transition_to_features().complete()?.into_crate_info(),
+        ParserState::Features(p) => p.complete()?.into_crate_info(),
     }
-    let mut state = State::Description;
+}
 
-    for line in lines {
-        match state {
-            State::Description => {
-                if is_known_key_line(line) {
-                    state = if line.starts_with("features:") {
-                        State::Features
-                    } else {
-                        fields.apply(line);
-                        State::Fields
-                    };
-                } else {
-                    description_parts.push(line);
-                }
-            }
-            State::Fields => {
-                if line.starts_with("features:") {
-                    state = State::Features;
-                } else {
-                    fields.apply(line);
-                }
-            }
-            State::Features => {
-                if let Some(feature) = parse_feature_line(line) {
-                    features.push(feature);
-                }
-                // Non-matching lines inside the features block are silently
-                // ignored; this allows future additions to the output format
-                // without breaking the parser.
-            }
-        }
-    }
-
-    let description = description_parts.join("\n");
-    let version = fields.version.ok_or(ParseError::MissingField("version"))?;
-    let license = fields.license.ok_or(ParseError::MissingField("license"))?;
-
-    Ok(CrateInfo {
-        name,
-        keywords,
-        description,
-        version,
-        license,
-        rust_version: fields.rust_version,
-        documentation: fields.documentation,
-        homepage: fields.homepage,
-        repository: fields.repository,
-        crates_io: fields.crates_io,
-        features,
-    })
+/// Represents a parser in any of its valid states.
+///
+/// This enum allows us to track which state the parser is currently in during
+/// the fold operation. Only valid transitions are possible because transforming
+/// from one ParserState variant to another is type-safe.
+enum ParserState {
+    Description(Parser<ParsingDescription>),
+    Fields(Parser<ParsingFields>),
+    Features(Parser<ParsingFeatures>),
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -149,7 +293,7 @@ pub fn parse(input: &str) -> Result<CrateInfo, ParseError> {
 /// Parses the first line of `cargo info` output into `(name, keywords)`.
 ///
 /// Input format: `<name>[ #<kw1> #<kw2> ...]`
-fn parse_header(line: &str) -> Result<(String, Vec<String>), ParseError> {
+pub fn parse_header(line: &str) -> Result<(String, Vec<String>), ParseError> {
     let mut parts = line.split_whitespace();
 
     let name = parts
@@ -167,7 +311,7 @@ fn parse_header(line: &str) -> Result<(String, Vec<String>), ParseError> {
 
 /// Returns `true` if `line` begins with one of the known field labels produced
 /// by `cargo info`.
-fn is_known_key_line(line: &str) -> bool {
+pub fn is_known_key_line(line: &str) -> bool {
     const KNOWN_PREFIXES: &[&str] = &[
         "version:",
         "license:",
@@ -183,20 +327,36 @@ fn is_known_key_line(line: &str) -> bool {
 
 /// Accumulates the optional key-value fields found between the description and
 /// the features block.
+///
+/// This structure holds all the optional metadata fields that may appear in
+/// `cargo info` output. Fields that do not appear in the output will be `None`.
 #[derive(Default)]
-struct RawFields {
-    version: Option<String>,
-    license: Option<String>,
-    rust_version: Option<String>,
-    documentation: Option<String>,
-    homepage: Option<String>,
-    repository: Option<String>,
-    crates_io: Option<String>,
+pub struct RawFields {
+    /// The published version (e.g., `"1.0.0"` or `"2.0.117"`).
+    pub version: Option<String>,
+
+    /// The SPDX license expression (e.g., `"MIT OR Apache-2.0"`).
+    pub license: Option<String>,
+
+    /// The minimum supported Rust version (e.g., `"1.71"`).
+    pub rust_version: Option<String>,
+
+    /// The URL to the crate's API documentation.
+    pub documentation: Option<String>,
+
+    /// The URL to the crate's project homepage.
+    pub homepage: Option<String>,
+
+    /// The URL to the crate's source code repository.
+    pub repository: Option<String>,
+
+    /// The URL to the crate's page on crates.io.
+    pub crates_io: Option<String>,
 }
 
 impl RawFields {
     /// Recognizes and stores a single `key: value` line.
-    fn apply(&mut self, line: &str) {
+    pub fn apply(&mut self, line: &str) {
         if let Some(v) = strip_key(line, "version:") {
             self.version = Some(v);
         } else if let Some(v) = strip_key(line, "license:") {
@@ -218,7 +378,7 @@ impl RawFields {
 
 /// Strips `prefix` from the start of `line` and trims the remainder.
 /// Returns `None` if `line` does not start with `prefix`.
-fn strip_key(line: &str, prefix: &str) -> Option<String> {
+pub fn strip_key(line: &str, prefix: &str) -> Option<String> {
     line.strip_prefix(prefix).map(|v| v.trim().to_owned())
 }
 
@@ -232,7 +392,7 @@ fn strip_key(line: &str, prefix: &str) -> Option<String> {
 /// ```
 ///
 /// Lines that do not match the expected indentation and structure return `None`.
-fn parse_feature_line(line: &str) -> Option<Feature> {
+pub fn parse_feature_line(line: &str) -> Option<Feature> {
     // Feature lines are indented exactly two characters:
     //   ' ' '+' → default (enabled) feature
     //   ' ' ' ' → non-default feature
@@ -279,534 +439,4 @@ fn parse_feature_line(line: &str) -> Option<Feature> {
         name,
         dependencies,
     })
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── Real cargo info outputs ───────────────────────────────────────────────
-
-    const SYN_OUTPUT: &str = "\
-syn #macros #syn
-Parser for Rust source code
-version: 2.0.117
-license: MIT OR Apache-2.0
-rust-version: 1.71
-documentation: https://docs.rs/syn
-repository: https://github.com/dtolnay/syn
-crates.io: https://crates.io/crates/syn/2.0.117
-features:
- +default      = [derive, parsing, printing, clone-impls, proc-macro]
-  clone-impls  = []
-  derive       = []
-  parsing      = []
-  printing     = [dep:quote]
-  proc-macro   = [proc-macro2/proc-macro, quote?/proc-macro]
-  extra-traits = []
-  fold         = []
-  full         = []
-  test         = [syn-test-suite/all-features]
-  visit        = []
-  visit-mut    = []
-";
-
-    const SERDE_OUTPUT: &str = "\
-serde #serde #serialization #no_std
-A generic serialization/deserialization framework
-version: 1.0.228
-license: MIT OR Apache-2.0
-rust-version: 1.56
-documentation: https://docs.rs/serde
-homepage: https://serde.rs
-repository: https://github.com/serde-rs/serde
-crates.io: https://crates.io/crates/serde/1.0.228
-features:
- +default      = [std]
-  std          = [serde_core/std]
-  alloc        = [serde_core/alloc]
-  derive       = [serde_derive]
-  rc           = [serde_core/rc]
-  serde_derive = [dep:serde_derive]
-  unstable     = [serde_core/unstable]
-";
-
-    // tokio has a two-line description
-    const TOKIO_OUTPUT: &str = "\
-tokio #io #async #non-blocking #futures
-An event-driven, non-blocking I/O platform for writing asynchronous I/O
-backed applications.
-version: 1.51.1
-license: MIT
-rust-version: 1.71
-documentation: https://docs.rs/tokio/1.51.1
-homepage: https://tokio.rs
-repository: https://github.com/tokio-rs/tokio
-crates.io: https://crates.io/crates/tokio/1.51.1
-features:
- +default              = []
-  fs                   = []
-  full                 = [fs, io-util, io-std, macros, net, parking_lot, process, rt, rt-multi-thread, signal, sync, time]
-  io-std               = []
-  io-util              = [bytes]
-  macros               = [tokio-macros]
-  rt                   = []
-  rt-multi-thread      = [rt]
-  sync                 = []
-  time                 = []
-";
-
-    const ANYHOW_OUTPUT: &str = "\
-anyhow #error #error-handling
-Flexible concrete Error type built on std::error::Error
-version: 1.0.102
-license: MIT OR Apache-2.0
-rust-version: 1.68
-documentation: https://docs.rs/anyhow
-repository: https://github.com/dtolnay/anyhow
-crates.io: https://crates.io/crates/anyhow/1.0.102
-features:
- +default   = [std]
-  std       = []
-  backtrace = []
-";
-
-    // Pre-release version (libc)
-    const LIBC_OUTPUT: &str = "\
-libc #libc #ffi #bindings #operating #system
-Raw FFI bindings to platform libraries like libc.
-version: 1.0.0-alpha.3
-license: MIT OR Apache-2.0
-rust-version: 1.63
-documentation: https://docs.rs/libc/1.0.0-alpha.3
-repository: https://github.com/rust-lang/libc
-crates.io: https://crates.io/crates/libc/1.0.0-alpha.3
-features:
- +default                  = [std]
-  std                      = []
-  extra_traits             = []
-  rustc-dep-of-std         = [rustc-std-workspace-core]
-  rustc-std-workspace-core = [dep:rustc-std-workspace-core]
-";
-
-    // ── parse_header ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn header_with_keywords() {
-        let (name, kws) = parse_header("syn #macros #syn").unwrap();
-        assert_eq!(name, "syn");
-        assert_eq!(kws, vec!["macros", "syn"]);
-    }
-
-    #[test]
-    fn header_without_keywords() {
-        let (name, kws) = parse_header("my-crate").unwrap();
-        assert_eq!(name, "my-crate");
-        assert!(kws.is_empty());
-    }
-
-    #[test]
-    fn header_many_keywords() {
-        let (name, kws) = parse_header("tokio #io #async #non-blocking #futures").unwrap();
-        assert_eq!(name, "tokio");
-        assert_eq!(kws, vec!["io", "async", "non-blocking", "futures"]);
-    }
-
-    #[test]
-    fn header_empty_returns_error() {
-        assert_eq!(
-            parse_header(""),
-            Err(ParseError::InvalidHeader("".to_owned()))
-        );
-    }
-
-    // ── parse_feature_line ────────────────────────────────────────────────────
-
-    #[test]
-    fn feature_line_default_no_deps() {
-        let f = parse_feature_line(" +default   = []").unwrap();
-        assert_eq!(f.name, "default");
-        assert!(f.is_default);
-        assert!(f.dependencies.is_empty());
-    }
-
-    #[test]
-    fn feature_line_non_default_no_deps() {
-        let f = parse_feature_line("  derive       = []").unwrap();
-        assert_eq!(f.name, "derive");
-        assert!(!f.is_default);
-        assert!(f.dependencies.is_empty());
-    }
-
-    #[test]
-    fn feature_line_with_multiple_deps() {
-        let line = " +default      = [derive, parsing, printing, clone-impls, proc-macro]";
-        let f = parse_feature_line(line).unwrap();
-        assert!(f.is_default);
-        assert_eq!(f.name, "default");
-        assert_eq!(
-            f.dependencies,
-            vec!["derive", "parsing", "printing", "clone-impls", "proc-macro"]
-        );
-    }
-
-    #[test]
-    fn feature_line_dep_colon_prefix() {
-        let f = parse_feature_line("  printing     = [dep:quote]").unwrap();
-        assert_eq!(f.dependencies, vec!["dep:quote"]);
-    }
-
-    #[test]
-    fn feature_line_dep_slash_optional() {
-        let f =
-            parse_feature_line("  proc-macro   = [proc-macro2/proc-macro, quote?/proc-macro]")
-                .unwrap();
-        assert_eq!(
-            f.dependencies,
-            vec!["proc-macro2/proc-macro", "quote?/proc-macro"]
-        );
-    }
-
-    #[test]
-    fn feature_line_dep_optional_dep() {
-        let f = parse_feature_line("  rustc-std-workspace-core = [dep:rustc-std-workspace-core]")
-            .unwrap();
-        assert_eq!(f.dependencies, vec!["dep:rustc-std-workspace-core"]);
-    }
-
-    #[test]
-    fn strip_key_missing_prefix_returns_none() {
-        assert_eq!(strip_key("version 1.0.0", "version:"), None);
-    }
-
-    #[test]
-    fn raw_fields_apply_recognizes_all_optional_fields() {
-        let mut fields = RawFields::default();
-        fields.apply("version: 0.2.0");
-        fields.apply("license: Apache-2.0");
-        fields.apply("rust-version: 1.70");
-        fields.apply("documentation: https://docs.rs/example");
-        fields.apply("homepage: https://example.com");
-        fields.apply("repository: https://example.com/repo");
-        fields.apply("crates.io: https://crates.io/crates/example/0.2.0");
-        fields.apply("unknown: ignored");
-
-        assert_eq!(fields.version.as_deref(), Some("0.2.0"));
-        assert_eq!(fields.license.as_deref(), Some("Apache-2.0"));
-        assert_eq!(fields.rust_version.as_deref(), Some("1.70"));
-        assert_eq!(fields.documentation.as_deref(), Some("https://docs.rs/example"));
-        assert_eq!(fields.homepage.as_deref(), Some("https://example.com"));
-        assert_eq!(fields.repository.as_deref(), Some("https://example.com/repo"));
-        assert_eq!(fields.crates_io.as_deref(), Some("https://crates.io/crates/example/0.2.0"));
-    }
-
-    #[test]
-    fn parse_feature_line_invalid_prefix_returns_none() {
-        assert!(parse_feature_line("x default = []").is_none());
-    }
-
-    #[test]
-    fn parse_feature_line_invalid_second_character_returns_none() {
-        assert!(parse_feature_line(" @invalid = []").is_none());
-    }
-
-    #[test]
-    fn parse_feature_line_missing_name_returns_none() {
-        assert!(parse_feature_line(" +    = []").is_none());
-    }
-
-    #[test]
-    fn parse_ignores_invalid_feature_lines_inside_features_block() {
-        let input = "my-crate\nA description\nversion: 0.1.0\nlicense: MIT\nfeatures:\n  invalid\n +default = []\n";
-        let info = parse(input).unwrap();
-        assert_eq!(info.features.len(), 1);
-        assert_eq!(info.features[0].name, "default");
-    }
-
-    #[test]
-    fn is_known_key_line_recognizes_known_prefixes() {
-        assert!(is_known_key_line("version: 1.0.0"));
-        assert!(is_known_key_line("license: MIT"));
-        assert!(is_known_key_line("rust-version: 1.71"));
-        assert!(is_known_key_line("features:"));
-        assert!(!is_known_key_line("some random text"));
-    }
-
-    #[test]
-    fn feature_line_non_feature_returns_none() {
-        assert!(parse_feature_line("version: 1.0.0").is_none());
-        assert!(parse_feature_line("").is_none());
-        assert!(parse_feature_line("features:").is_none());
-    }
-
-    // ── Full parse: syn ───────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_syn_name_and_keywords() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        assert_eq!(info.name, "syn");
-        assert_eq!(info.keywords, vec!["macros", "syn"]);
-    }
-
-    #[test]
-    fn parse_syn_description() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        assert_eq!(info.description, "Parser for Rust source code");
-    }
-
-    #[test]
-    fn parse_syn_version_and_license() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        assert_eq!(info.version, "2.0.117");
-        assert_eq!(info.license, "MIT OR Apache-2.0");
-    }
-
-    #[test]
-    fn parse_syn_optional_fields() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        assert_eq!(info.rust_version.as_deref(), Some("1.71"));
-        assert_eq!(info.documentation.as_deref(), Some("https://docs.rs/syn"));
-        assert!(info.homepage.is_none());
-        assert_eq!(
-            info.repository.as_deref(),
-            Some("https://github.com/dtolnay/syn")
-        );
-        assert_eq!(
-            info.crates_io.as_deref(),
-            Some("https://crates.io/crates/syn/2.0.117")
-        );
-    }
-
-    #[test]
-    fn parse_syn_features_count() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        assert_eq!(info.features.len(), 12);
-    }
-
-    #[test]
-    fn parse_syn_default_feature() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        let default_feat = &info.features[0];
-        assert_eq!(default_feat.name, "default");
-        assert!(default_feat.is_default);
-        assert_eq!(
-            default_feat.dependencies,
-            vec!["derive", "parsing", "printing", "clone-impls", "proc-macro"]
-        );
-    }
-
-    #[test]
-    fn parse_syn_non_default_feature() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        let derive_feat = info.features.iter().find(|f| f.name == "derive").unwrap();
-        assert!(!derive_feat.is_default);
-        assert!(derive_feat.dependencies.is_empty());
-    }
-
-    #[test]
-    fn parse_syn_feature_with_dep_colon() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        let printing = info
-            .features
-            .iter()
-            .find(|f| f.name == "printing")
-            .unwrap();
-        assert_eq!(printing.dependencies, vec!["dep:quote"]);
-    }
-
-    #[test]
-    fn parse_syn_feature_complex_deps() {
-        let info = parse(SYN_OUTPUT).unwrap();
-        let proc_macro = info
-            .features
-            .iter()
-            .find(|f| f.name == "proc-macro")
-            .unwrap();
-        assert_eq!(
-            proc_macro.dependencies,
-            vec!["proc-macro2/proc-macro", "quote?/proc-macro"]
-        );
-    }
-
-    // ── Full parse: serde (has homepage) ─────────────────────────────────────
-
-    #[test]
-    fn parse_serde_homepage_present() {
-        let info = parse(SERDE_OUTPUT).unwrap();
-        assert_eq!(info.homepage.as_deref(), Some("https://serde.rs"));
-    }
-
-    #[test]
-    fn parse_serde_keywords() {
-        let info = parse(SERDE_OUTPUT).unwrap();
-        assert_eq!(info.keywords, vec!["serde", "serialization", "no_std"]);
-    }
-
-    #[test]
-    fn parse_serde_features() {
-        let info = parse(SERDE_OUTPUT).unwrap();
-        assert_eq!(info.features.len(), 7);
-
-        let default_feat = &info.features[0];
-        assert!(default_feat.is_default);
-        assert_eq!(default_feat.dependencies, vec!["std"]);
-    }
-
-    // ── Full parse: tokio (multi-line description) ────────────────────────────
-
-    #[test]
-    fn parse_tokio_multiline_description() {
-        let info = parse(TOKIO_OUTPUT).unwrap();
-        assert_eq!(
-            info.description,
-            "An event-driven, non-blocking I/O platform for writing asynchronous I/O\nbacked applications."
-        );
-    }
-
-    #[test]
-    fn parse_tokio_keywords() {
-        let info = parse(TOKIO_OUTPUT).unwrap();
-        assert_eq!(info.keywords, vec!["io", "async", "non-blocking", "futures"]);
-    }
-
-    #[test]
-    fn parse_tokio_default_feature_empty_deps() {
-        let info = parse(TOKIO_OUTPUT).unwrap();
-        let default_feat = &info.features[0];
-        assert!(default_feat.is_default);
-        assert!(default_feat.dependencies.is_empty());
-    }
-
-    // ── Full parse: libc (pre-release version) ───────────────────────────────
-
-    #[test]
-    fn parse_libc_prerelease_version() {
-        let info = parse(LIBC_OUTPUT).unwrap();
-        assert_eq!(info.version, "1.0.0-alpha.3");
-    }
-
-    // ── Full parse: anyhow ────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_anyhow_no_homepage() {
-        let info = parse(ANYHOW_OUTPUT).unwrap();
-        assert!(info.homepage.is_none());
-    }
-
-    #[test]
-    fn parse_anyhow_features() {
-        let info = parse(ANYHOW_OUTPUT).unwrap();
-        assert_eq!(info.features.len(), 3);
-    }
-
-    // ── Error cases ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn error_on_empty_input() {
-        assert_eq!(parse(""), Err(ParseError::Empty));
-    }
-
-    #[test]
-    fn error_on_missing_version() {
-        let input = "my-crate\nA description\nlicense: MIT\n";
-        assert_eq!(parse(input), Err(ParseError::MissingField("version")));
-    }
-
-    #[test]
-    fn error_on_missing_license() {
-        let input = "my-crate\nA description\nversion: 1.0.0\n";
-        assert_eq!(parse(input), Err(ParseError::MissingField("license")));
-    }
-
-    // ── Edge cases ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn no_features_section() {
-        let input = "my-crate\nA simple crate\nversion: 0.1.0\nlicense: MIT\n";
-        let info = parse(input).unwrap();
-        assert!(info.features.is_empty());
-    }
-
-    #[test]
-    fn empty_features_section() {
-        let input = "my-crate\nA simple crate\nversion: 0.1.0\nlicense: MIT\nfeatures:\n";
-        let info = parse(input).unwrap();
-        assert!(info.features.is_empty());
-    }
-
-    #[test]
-    fn no_keywords() {
-        let input = "my-crate\nA description\nversion: 1.0.0\nlicense: MIT\n";
-        let info = parse(input).unwrap();
-        assert_eq!(info.name, "my-crate");
-        assert!(info.keywords.is_empty());
-    }
-
-    #[test]
-    fn all_optional_fields_absent() {
-        let input = "mini-crate\nDoes one thing\nversion: 0.1.0\nlicense: MIT\n";
-        let info = parse(input).unwrap();
-        assert!(info.rust_version.is_none());
-        assert!(info.documentation.is_none());
-        assert!(info.homepage.is_none());
-        assert!(info.repository.is_none());
-        assert!(info.crates_io.is_none());
-    }
-
-    #[test]
-    fn feature_line_dependencies_with_whitespace() {
-        // Test that the filter for empty strings after trim works
-        let line = "  feature     = [dep1, , dep2]";
-        if let Some(f) = parse_feature_line(line) {
-            // Whitespace-only deps should be filtered out
-            assert!(!f.dependencies.iter().any(|d| d.is_empty()));
-        }
-    }
-
-    #[test]
-    fn feature_line_with_spaces_between_deps() {
-        // Ensure the filter removes entries that become empty after trimming
-        let line = "  myfeature   = [a,   ,b]";
-        if let Some(f) = parse_feature_line(line) {
-            // All dependencies should have content
-            assert!(f.dependencies.iter().all(|d| !d.is_empty() && !d.trim().is_empty()));
-        }
-    }
-
-    #[test]
-    fn parse_with_all_optional_fields_present() {
-        // Comprehensive test covering all optional fields in parse context
-        let input = "testcrate #test
-A test crate
-version: 1.0.0
-license: MIT
-rust-version: 1.70
-documentation: https://docs.rs/test
-homepage: https://test.com
-repository: https://github.com/test/test
-crates.io: https://crates.io/crates/test/1.0.0
-features:
- +default = []
-";
-        let info = parse(input).unwrap();
-        assert_eq!(info.name, "testcrate");
-        assert_eq!(info.version, "1.0.0");
-        assert_eq!(info.license, "MIT");
-        assert_eq!(info.rust_version.as_deref(), Some("1.70"));
-        assert_eq!(info.documentation.as_deref(), Some("https://docs.rs/test"));
-        assert_eq!(info.homepage.as_deref(), Some("https://test.com"));
-        assert_eq!(info.repository.as_deref(), Some("https://github.com/test/test"));
-        assert_eq!(info.crates_io.as_deref(), Some("https://crates.io/crates/test/1.0.0"));
-    }
-
-    #[test]
-    fn feature_line_with_multiple_spaces_in_deps() {
-        // Test edge case with multiple consecutive spaces between dependencies
-        let line = "  test = [a,     b, c]";
-        if let Some(f) = parse_feature_line(line) {
-            assert_eq!(f.dependencies, vec!["a", "b", "c"]);
-        }
-    }
 }

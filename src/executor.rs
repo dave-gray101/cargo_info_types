@@ -74,44 +74,4 @@ pub fn execute(crate_name: &str) -> Result<CrateInfo, ExecuteError> {
     Ok(info)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn execute_nonexistent_crate_returns_cargo_error() {
-        let result = execute("cargo_info_types_coverage_test_no_crate_12345");
-
-        match result {
-            Err(ExecuteError::CargoError { code, stderr }) => {
-                assert_ne!(code, 0);
-                assert!(!stderr.trim().is_empty());
-            }
-            Err(ExecuteError::Io(err)) => {
-                panic!("cargo binary must be available for this test: {err}");
-            }
-            Err(ExecuteError::Parse(err)) => {
-                panic!("expected cargo error, got parse error: {err}");
-            }
-            Ok(_) => panic!("expected cargo info to fail for nonexistent crate"),
-        }
-    }
-
-    #[test]
-    fn execute_returns_crate_info_struct_on_success() {
-        // Test with a real, stable crate that should always be available
-        let result = execute("serde");
-        match result {
-            Ok(info) => {
-                assert!(!info.name.is_empty());
-                assert!(!info.version.is_empty());
-                assert!(!info.license.is_empty());
-            }
-            Err(e) => {
-                // If network/cargo unavailable, that's OK - just ensure we tried
-                eprintln!("Execute test skipped due to: {}", e);
-            }
-        }
-    }
-}
 

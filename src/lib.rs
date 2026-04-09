@@ -7,12 +7,12 @@
 //! - [`CrateInfo`] — the top-level structure representing everything `cargo info`
 //!   reports about a crate.
 //! - [`Feature`] — a single Cargo feature flag with its dependency list.
-//! - [`parse`] — parses the text output of `cargo info -q <crate> --color never`
+//! - [`parse()`] — parses the text output of `cargo info -q <crate> --color never`
 //!   into a [`CrateInfo`].
-//! - [`strip_ansi_escapes`] — removes ANSI/VT100 color sequences from a string
-//!   before passing it to [`parse`], for cases where `--color never` cannot be
+//! - [`strip_ansi_escapes()`] — removes ANSI/VT100 color sequences from a string
+//!   before passing it to [`parse()`], for cases where `--color never` cannot be
 //!   used.
-//! - [`execute`] *(feature: `execute`)* — runs `cargo info` for a given crate
+//! - `execute()` *(feature: `execute`)* — runs `cargo info` for a given crate
 //!   name and returns the parsed result in one call.
 //!
 //! ## Quick start
@@ -55,7 +55,7 @@
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `execute` | Enables [`execute`], which spawns `cargo info` as a subprocess. Adds no extra dependencies. |
+//! | `execute` | Enables command execution, which spawns `cargo info` as a subprocess. Adds no extra dependencies. |
 //!
 //! [`cargo info`]: https://doc.rust-lang.org/cargo/commands/cargo-info.html
 
@@ -63,7 +63,7 @@ mod executor;
 mod parser;
 mod types;
 
-pub use parser::{parse, ParseError};
+pub use parser::{parse, parse_header, parse_feature_line, strip_key, is_known_key_line, RawFields, ParseError};
 pub use types::{CrateInfo, Feature};
 
 #[cfg(feature = "execute")]
@@ -74,12 +74,10 @@ pub use executor::{execute, ExecuteError};
 /// `cargo info` emits ANSI SGR color codes when writing to a terminal. Passing
 /// `--color never` to the command suppresses them, but this function provides
 /// an alternative when controlling the command flags is not possible, or when
-/// you want to pre-process colorized output before passing it to [`parse`].
+/// you want to pre-process colorized output before passing it to [`parse()`].
 ///
-/// Sequence removal is delegated to the [`strip-ansi-escapes`] crate, which is
-/// backed by the [`vte`] parser used by terminals such as Alacritty.
-///
-/// [`strip-ansi-escapes`]: https://crates.io/crates/strip-ansi-escapes
+/// Sequence removal is delegated to the `strip-ansi-escapes` crate, which is
+/// backed by the VT100 parser used by terminals such as Alacritty.
 ///
 /// # Examples
 ///
@@ -98,19 +96,6 @@ pub fn strip_ansi_escapes(input: &str) -> String {
         .expect("stripped output is valid UTF-8")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::strip_ansi_escapes;
 
-    #[test]
-    fn strip_ansi_escapes_removes_vt100_sequences() {
-        let colored = "\x1b[1;32m+default\x1b[0m      = [std]";
-        assert_eq!(strip_ansi_escapes(colored), "+default      = [std]");
-    }
-
-    #[test]
-    fn strip_ansi_escapes_leaves_plain_text_intact() {
-        let plain = "no escapes here";
-        assert_eq!(strip_ansi_escapes(plain), plain);
-    }
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
+// Tests have been moved to: tests/lib.rs
