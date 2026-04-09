@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Cargo Tarpaulin",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["tarpaulin"],
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Open Tarpaulin Report",
+      "type": "shell",
+      "command": "cmd",
+      "args": ["/c", "start", "\"\"", "${workspaceFolder}\\target\\tarpaulin\\tarpaulin-report.html"],
+      "dependsOn": ["Run Cargo Tarpaulin"],
+      "problemMatcher": []
+    }
+  ]
+}

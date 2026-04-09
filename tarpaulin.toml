@@ -1,0 +1,10 @@
+[test_config]
+output-dir = "target/tarpaulin"
+follow-exec = true
+features = "execute"
+
+[report]
+follow-exec = true
+features = "execute"
+output-dir = "target/tarpaulin"
+out = ["Html", "Json"]
