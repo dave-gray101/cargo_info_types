@@ -4,7 +4,6 @@ Parse the output of [`cargo info`](https://doc.rust-lang.org/cargo/commands/carg
 
 [![Crates.io](https://img.shields.io/crates/v/cargo_info_types.svg)](https://crates.io/crates/cargo_info_types)
 [![Docs.rs](https://docs.rs/cargo_info_types/badge.svg)](https://docs.rs/cargo_info_types)
-[![License](https://img.shields.io/crates/l/cargo_info_types.svg)](https://github.com/dtolnay/cargo_info_types#license)
 
 ## Overview
 
